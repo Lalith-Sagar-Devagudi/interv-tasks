@@ -1,51 +1,45 @@
-"""Agentic RAG orchestrator using LangGraph.
+"""Multi-Agent Legal QA Orchestrator.
 
-Graph topology
-──────────────
-  START
-    │
-    ▼
-  restructure_query   (Tool 1) — LLM rewrites query for better VDB recall
-    │
-    ▼
-  retrieve_docs       (Tool 2) — semantic search against vector DB
-    │
-    ▼
-  validate_relevance  (Tool 3) — LLM judges which chunks truly answer the question
-    │
-    ▼
-  generate_answer     — LLM produces final answer from (original question + validated docs)
-    │
-    ▼
-   END
+Architecture
+────────────
+Three specialist sub-agents are exposed as tools to an orchestrator LLM.
+The orchestrator follows a mandatory 4-step workflow defined in its system prompt:
 
-All graph nodes are synchronous.  The entire graph is run via
-asyncio.to_thread(graph.invoke, ...) so it executes in a worker thread
-without blocking the event loop, allowing the RAG pipeline to run truly
-in parallel via asyncio.gather.
+  STEP 1  QueryRestructureAgent  — scope-check + query rewrite (own LLM)
+  STEP 2  DocumentRetriever      — Qdrant vector search (no LLM)
+  STEP 3  RelevanceValidatorAgent— chunk relevance filter  (own LLM)
+  STEP 4  Orchestrator itself    — final answer generation (no tool call)
 
-Token usage is accumulated across all three LLM nodes so cost reflects
-the full agentic pipeline.
+The orchestrator LLM drives the flow via native tool-calling.  After receiving
+the validated excerpts from Step 3 it generates the final answer directly —
+no separate node or sub-agent for Step 4.
+
+Token accounting
+────────────────
+  sub_input_tokens / sub_output_tokens  — accumulated from Steps 1 and 3
+  orch_input_tokens / orch_output_tokens — all orchestrator LLM turns combined
+  Total reported = sub + orch (full cost of the pipeline)
+
+Concurrency safety
+──────────────────
+Per-request mutable state (token counters, retrieval results) lives in a dict
+created inside each run() call and captured by tool closures — safe for
+concurrent requests hitting the same orchestrator instance.
 """
 
+import asyncio
 import time
-import traceback
-from typing import TypedDict
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.tools import StructuredTool
 from langchain_openai import ChatOpenAI
-from langgraph.graph import END, START, StateGraph
+from pydantic import BaseModel, Field
 
 from approach2_agents.tools.query_restructure_tool import (
     NOT_ANSWERABLE,
-    _do_restructure,
-    init_restructure_tool,
+    QueryRestructureAgent,
 )
-from shared.topic_extractor import TopicExtractor
-from approach2_agents.tools.relevance_validator_tool import (
-    _do_validate,
-    init_validator_tool,
-)
+from approach2_agents.tools.relevance_validator_tool import RelevanceValidatorAgent
 from shared.config import (
     LLM_INPUT_COST_PER_M,
     LLM_MAX_TOKENS,
@@ -54,222 +48,315 @@ from shared.config import (
     OPENROUTER_API_KEY,
     OPENROUTER_BASE_URL,
 )
+from shared.topic_extractor import TopicExtractor
 from shared.vector_store import VectorStore
 
 
-# ── State schema ──────────────────────────────────────────────────────────────
+# ── Orchestrator system prompt ─────────────────────────────────────────────────
 
-class QAState(TypedDict):
-    question: str             # original user question — never mutated
-    restructured_query: str   # query rewritten by Tool 1
-    retrieved_docs: str       # formatted excerpts from Tool 2
-    validated_docs: str       # filtered excerpts from Tool 3
-    sources: list[str]        # unique source filenames from retrieval
-    answer: str               # final LLM answer
-    confidence_score: float   # avg cosine similarity of retrieved chunks
-    input_tokens: int         # accumulated across all LLM calls
-    output_tokens: int        # accumulated across all LLM calls
+_ORCHESTRATOR_SYSTEM = """\
+You are a senior legal research orchestrator managing a multi-agent pipeline.
+Your responsibility is to answer user questions about a legal document corpus by
+coordinating three specialist sub-agents in a fixed sequence, then generating
+the final answer yourself.
+
+══════════════════════════════════════════════
+  MANDATORY WORKFLOW — follow every step in order
+══════════════════════════════════════════════
+
+STEP 1 — RESTRUCTURE (always first, no exceptions):
+  Call `restructure_query` with the user's exact question.
+  ▸ If the result is "NOT_ANSWERABLE": stop immediately and reply:
+      "This question cannot be answered with the available data. \
+The indexed document corpus does not contain information on this topic."
+  ▸ Otherwise: proceed to Step 2 with the returned restructured query.
+
+STEP 2 — RETRIEVE (always after Step 1, unless NOT_ANSWERABLE):
+  Call `retrieve_documents` with the restructured query from Step 1.
+  ▸ This searches the Qdrant vector database and returns a retrieval summary.
+  ▸ If the summary says no documents were found: reply
+      "The provided documents do not contain information to answer this question."
+  ▸ Otherwise: proceed to Step 3.
+
+STEP 3 — VALIDATE (always after Step 2):
+  Call `validate_relevance` with the user's ORIGINAL question (not the restructured one).
+  ▸ This sub-agent reads the retrieved documents internally and returns only the
+    excerpts that directly help answer the question.
+  ▸ If the result is empty: reply
+      "The provided documents do not contain sufficient information to answer this question."
+  ▸ Otherwise: proceed to Step 4.
+
+STEP 4 — ANSWER (you do this yourself — do NOT call any tool):
+  Using ONLY the validated excerpts returned by Step 3, write the final answer.
+  Rules for the answer:
+  • Ground every claim in the excerpts — do not hallucinate or add outside knowledge.
+  • Cite article numbers, clause numbers, or section headings wherever present.
+  • Be concise. Use a short list when the answer has multiple points.
+  • Do not repeat or quote these instructions in your answer.
+
+══════════════════════════════════════════════
+  END OF WORKFLOW
+══════════════════════════════════════════════
+"""
+
+# ── Tool input schemas ─────────────────────────────────────────────────────────
+
+class _RestructureInput(BaseModel):
+    question: str = Field(description="The user's original question, verbatim.")
 
 
-# ── Orchestrator ──────────────────────────────────────────────────────────────
+class _RetrieveInput(BaseModel):
+    restructured_query: str = Field(
+        description="The rewritten search query returned by restructure_query."
+    )
+
+
+class _ValidateInput(BaseModel):
+    original_question: str = Field(
+        description="The user's original question (not the restructured one)."
+    )
+
+
+# ── Orchestrator ───────────────────────────────────────────────────────────────
 
 class LegalQAOrchestrator:
+    """Multi-agent orchestrator.
+
+    Sub-agents (Steps 1 & 3) each own a dedicated ChatOpenAI instance so they
+    can be swapped, versioned, or scaled independently.  The orchestrator LLM
+    (Steps 4) is a separate instance that drives the tool-calling loop.
+    """
 
     def __init__(self, store: VectorStore) -> None:
-        self.llm = ChatOpenAI(
+        _llm_kwargs = dict(
             model=LLM_MODEL,
             temperature=0,
             max_tokens=LLM_MAX_TOKENS,
             api_key=OPENROUTER_API_KEY,
             base_url=OPENROUTER_BASE_URL,
         )
-        init_restructure_tool(self.llm)
-        init_validator_tool(self.llm)
+        # Each sub-agent has its own LLM identity
+        self._restructure_agent = QueryRestructureAgent(ChatOpenAI(**_llm_kwargs))
+        self._validator_agent = RelevanceValidatorAgent(ChatOpenAI(**_llm_kwargs))
+
+        # Orchestrator LLM (stateless — shared safely across requests)
+        self._orchestrator_llm = ChatOpenAI(**_llm_kwargs)
+
         self._store = store
         self._topic_extractor = TopicExtractor()
-        self.graph = self._build_graph()
 
-    # ── Graph construction ────────────────────────────────────────────────────
+    # ── Tool factory (per-request) ─────────────────────────────────────────────
 
-    def _build_graph(self):
-        g = StateGraph(QAState)
+    def _make_tools(self, state: dict) -> list[StructuredTool]:
+        """Build tool wrappers that capture per-request state in their closures.
 
-        g.add_node("restructure_query",   self._restructure_node)
-        g.add_node("retrieve_docs",       self._retrieve_node)
-        g.add_node("validate_relevance",  self._validate_node)
-        g.add_node("generate_answer",     self._generate_node)
-
-        g.add_edge(START,                "restructure_query")
-        g.add_edge("restructure_query",  "retrieve_docs")
-        g.add_edge("retrieve_docs",      "validate_relevance")
-        g.add_edge("validate_relevance", "generate_answer")
-        g.add_edge("generate_answer",    END)
-
-        return g.compile()
-
-    # ── Nodes (sync — run inside a worker thread via asyncio.to_thread) ───────
-
-    def _restructure_node(self, state: QAState) -> dict:
-        """Tool 1 — Rewrite the user question into a targeted VDB search query.
-
-        Fetches the current corpus topics from TopicExtractor (cached, refreshed
-        on corpus change) and injects them into the LLM prompt so it can detect
-        when a question is outside the scope of the indexed documents.
+        Called once per run() invocation — lightweight (no new connections).
         """
-        print(f"[agent:restructure] Original question: {state['question']!r}")
-        topics = self._topic_extractor.get_topics(self._store)
-        restructured, usage = _do_restructure(self.llm, state["question"], topics)
-        if restructured == NOT_ANSWERABLE:
-            print("[agent:restructure] Question is out of corpus scope → NOT_ANSWERABLE")
-        else:
-            print(f"[agent:restructure] Restructured query: {restructured!r}  usage={usage}")
-        return {
-            "restructured_query": restructured,
-            "input_tokens":  state.get("input_tokens",  0) + usage.get("input_tokens",  0),
-            "output_tokens": state.get("output_tokens", 0) + usage.get("output_tokens", 0),
-        }
 
-    def _retrieve_node(self, state: QAState) -> dict:
-        """Tool 2 — Retrieve document excerpts using the restructured query."""
-        query = state["restructured_query"]
-        if query == NOT_ANSWERABLE:
-            print("[agent:retrieve] Skipping retrieval — question is out of corpus scope")
-            return {"retrieved_docs": "", "sources": [], "confidence_score": 0.0}
-        print(f"[agent:retrieve] Querying VDB with: {query!r}")
+        # ── Tool 1: QueryRestructureAgent ──────────────────────────────────────
+        def restructure_query(question: str) -> str:
+            """Scope-check the question and rewrite it for vector DB search.
+            Returns the rewritten query, or NOT_ANSWERABLE if out of corpus scope.
+            """
+            topics = self._topic_extractor.get_topics(self._store)
+            result, usage = self._restructure_agent.run(question, topics)
+            state["sub_input_tokens"]  += usage.get("input_tokens",  0)
+            state["sub_output_tokens"] += usage.get("output_tokens", 0)
+            return result
 
-        results = self._store.similarity_search_with_scores(query, top_k=10)
-        print(f"[agent:retrieve] Qdrant returned {len(results)} results")
+        # ── Tool 2: DocumentRetriever (no LLM) ────────────────────────────────
+        def retrieve_documents(restructured_query: str) -> str:
+            """Search the Qdrant vector database with the restructured query.
+            Returns a retrieval summary; full excerpts are held internally for
+            the validate_relevance step.
+            """
+            if restructured_query == NOT_ANSWERABLE:
+                state["retrieved_docs"] = ""
+                state["confidence_score"] = 0.0
+                state["sources"] = []
+                return NOT_ANSWERABLE
 
-        if not results:
-            print("[agent:retrieve] No results found")
-            return {"retrieved_docs": "", "sources": [], "confidence_score": 0.0}
+            results = self._store.similarity_search_with_scores(
+                restructured_query, top_k=10
+            )
+            if not results:
+                state["retrieved_docs"] = ""
+                state["confidence_score"] = 0.0
+                state["sources"] = []
+                return "No documents found in the vector database for this query."
 
-        parts, sources, scores = [], [], []
-        for i, (doc, score) in enumerate(results, 1):
-            src = doc.metadata.get("source", "unknown")
-            print(f"[agent:retrieve]   {i}. source={src!r}  score={score:.4f}  preview={doc.page_content[:80].replace(chr(10), ' ')!r}")
-            parts.append(f"[Excerpt {i} | File: {src} | Score: {score:.4f}]\n{doc.page_content}")
-            scores.append(float(score))
-            if src not in sources:
-                sources.append(src)
-
-        confidence = round(sum(scores) / len(scores), 4)
-        return {
-            "retrieved_docs": "\n\n---\n\n".join(parts),
-            "sources": sources,
-            "confidence_score": confidence,
-        }
-
-    def _validate_node(self, state: QAState) -> dict:
-        """Tool 3 — Filter retrieved excerpts down to only those relevant to the question."""
-        print(f"[agent:validate] Validating {len(state.get('retrieved_docs', ''))} chars of retrieved docs ...")
-
-        if not state.get("retrieved_docs"):
-            print("[agent:validate] No docs to validate")
-            return {"validated_docs": ""}
-
-        validated, usage = _do_validate(self.llm, state["question"], state["retrieved_docs"])
-        print(f"[agent:validate] Validated docs: {len(validated)} chars  usage={usage}")
-        return {
-            "validated_docs": validated,
-            "input_tokens":  state.get("input_tokens",  0) + usage.get("input_tokens",  0),
-            "output_tokens": state.get("output_tokens", 0) + usage.get("output_tokens", 0),
-        }
-
-    def _generate_node(self, state: QAState) -> dict:
-        """Final LLM call — answer the original question using validated excerpts."""
-        print(f"[agent:generate] Generating answer with model={LLM_MODEL!r} ...")
-
-        if state.get("restructured_query") == NOT_ANSWERABLE:
-            print("[agent:generate] Returning NOT_ANSWERABLE response — question out of corpus scope")
-            return {
-                "answer": (
-                    "This question cannot be answered with the available data. "
-                    "The indexed document corpus does not contain information on this topic."
+            parts, sources, scores = [], [], []
+            for i, (doc, score) in enumerate(results, 1):
+                src = doc.metadata.get("source", "unknown")
+                parts.append(
+                    f"[Excerpt {i} | File: {src} | Score: {score:.4f}]\n"
+                    f"{doc.page_content}"
                 )
-            }
+                scores.append(float(score))
+                if src not in sources:
+                    sources.append(src)
 
-        context = state.get("validated_docs") or state.get("retrieved_docs", "")
-        if not context:
-            print("[agent:generate] No context available")
-            return {"answer": "The provided documents do not contain information to answer this question."}
+            state["retrieved_docs"]  = "\n\n---\n\n".join(parts)
+            state["confidence_score"] = round(sum(scores) / len(scores), 4)
+            state["sources"]          = sources
 
-        system_content = """\
-You are a precise legal document analyst.
-Answer the user's question based strictly on the provided document excerpts.
+            print(
+                f"[DocumentRetriever] {len(results)} excerpts from {sources}  "
+                f"avg_score={state['confidence_score']}"
+            )
+            preview = results[0][0].page_content[:150].replace("\n", " ")
+            return (
+                f"Retrieved {len(results)} document excerpts from: {sources}\n"
+                f"Average relevance score: {state['confidence_score']}\n"
+                f"Top excerpt preview: \"{preview}...\""
+            )
 
-Rules:
-- Use only information present in the excerpts — do not hallucinate.
-- If the answer cannot be found, say: "The provided documents do not contain sufficient information to answer this question."
-- Be concise; cite clause numbers or section headings when available."""
-        human_content = f"Document excerpts:\n{context}\n\nQuestion: {state['question']}\n\nAnswer:"
+        # ── Tool 3: RelevanceValidatorAgent ────────────────────────────────────
+        def validate_relevance(original_question: str) -> str:
+            """Filter the retrieved excerpts to only those relevant to the question.
+            Returns the validated excerpts for the orchestrator to use in its answer.
+            """
+            retrieved_docs = state.get("retrieved_docs", "")
+            if not retrieved_docs:
+                return ""
 
-        print("[agent:generate] ── FULL PROMPT ──────────────────────────────")
-        print(f"[agent:generate] SYSTEM:\n{system_content}")
-        print(f"[agent:generate] HUMAN ({len(human_content)} chars):\n{human_content}")
-        print("[agent:generate] ── END PROMPT ──────────────────────────────")
+            validated, usage = self._validator_agent.run(
+                original_question, retrieved_docs
+            )
+            state["sub_input_tokens"]  += usage.get("input_tokens",  0)
+            state["sub_output_tokens"] += usage.get("output_tokens", 0)
+            state["validated_docs"] = validated
 
-        messages = [
-            SystemMessage(content=system_content),
-            HumanMessage(content=human_content),
+            if not validated:
+                return "No excerpts were found to be relevant to the question."
+            return validated  # Orchestrator reads this to write Step 4 answer
+
+        return [
+            StructuredTool.from_function(
+                func=restructure_query,
+                name="restructure_query",
+                description=(
+                    "Scope-check the user's question against the legal corpus and "
+                    "rewrite it as a precise vector DB search query. "
+                    "Returns NOT_ANSWERABLE if the question is completely outside scope."
+                ),
+                args_schema=_RestructureInput,
+            ),
+            StructuredTool.from_function(
+                func=retrieve_documents,
+                name="retrieve_documents",
+                description=(
+                    "Search the Qdrant legal document vector database using the "
+                    "restructured query. Returns a retrieval summary."
+                ),
+                args_schema=_RetrieveInput,
+            ),
+            StructuredTool.from_function(
+                func=validate_relevance,
+                name="validate_relevance",
+                description=(
+                    "Filter the retrieved document excerpts down to only those that "
+                    "directly help answer the original question. "
+                    "Returns the relevant excerpts for use in the final answer."
+                ),
+                args_schema=_ValidateInput,
+            ),
         ]
 
-        response = self.llm.invoke(messages)
-        usage = response.usage_metadata or {}
-        answer = response.content.strip()
-        print(f"[agent:generate] Answer ({len(answer)} chars): {answer[:120]!r}{'...' if len(answer) > 120 else ''}  usage={usage}")
-
-        return {
-            "answer": answer,
-            "input_tokens":  state.get("input_tokens",  0) + usage.get("input_tokens",  0),
-            "output_tokens": state.get("output_tokens", 0) + usage.get("output_tokens", 0),
-        }
-
-    # ── Public entry point ────────────────────────────────────────────────────
+    # ── Public entry point ─────────────────────────────────────────────────────
 
     async def run(self, question: str) -> dict:
-        print(f"[agent] ▶ Starting agentic RAG for: {question!r}")
+        """Run the full multi-agent pipeline for a single question.
+
+        The orchestrator drives tool calls for Steps 1–3, then generates the
+        final answer itself (Step 4) when it stops calling tools.
+        """
+        print(f"\n[Orchestrator] ▶ Starting multi-agent pipeline for: {question!r}")
         start = time.perf_counter()
 
-        initial: QAState = {
-            "question": question,
-            "restructured_query": "",
-            "retrieved_docs": "",
-            "validated_docs": "",
-            "sources": [],
-            "answer": "",
-            "confidence_score": 0.0,
-            "input_tokens": 0,
-            "output_tokens": 0,
+        # Per-request mutable state — captured by tool closures above
+        state: dict = {
+            "sub_input_tokens":  0,
+            "sub_output_tokens": 0,
+            "retrieved_docs":    "",
+            "validated_docs":    "",
+            "confidence_score":  0.0,
+            "sources":           [],
         }
 
-        # Use ainvoke so LangGraph manages thread-pool execution of sync nodes
-        # internally — avoids asyncio event-loop conflicts that arise when
-        # wrapping graph.invoke() in asyncio.to_thread().
-        try:
-            final = await self.graph.ainvoke(initial)
-        except Exception:
-            traceback.print_exc()
-            raise
+        tools = self._make_tools(state)
+        llm_with_tools = self._orchestrator_llm.bind_tools(tools)
+        tool_map = {t.name: t for t in tools}
 
-        latency = round(time.perf_counter() - start, 3)
-        input_tokens  = final.get("input_tokens",  0)
-        output_tokens = final.get("output_tokens", 0)
+        messages = [
+            SystemMessage(content=_ORCHESTRATOR_SYSTEM),
+            HumanMessage(content=question),
+        ]
+
+        orch_input_tokens  = 0
+        orch_output_tokens = 0
+
+        # ── Tool-calling loop ──────────────────────────────────────────────────
+        while True:
+            response: AIMessage = await asyncio.to_thread(
+                llm_with_tools.invoke, messages
+            )
+            usage = response.usage_metadata or {}
+            orch_input_tokens  += usage.get("input_tokens",  0)
+            orch_output_tokens += usage.get("output_tokens", 0)
+            messages.append(response)
+
+            if not response.tool_calls:
+                # Orchestrator generated the final answer — Step 4 complete
+                print(
+                    f"[Orchestrator] ◀ Step 4 done by orchestrator "
+                    f"({len(response.content)} chars)"
+                )
+                break
+
+            # Execute each tool call and feed results back as ToolMessages
+            for tool_call in response.tool_calls:
+                tool_name = tool_call["name"]
+                tool_args = tool_call["args"]
+                print(f"[Orchestrator] → calling tool {tool_name!r} with args={tool_args}")
+
+                tool_result = await asyncio.to_thread(
+                    tool_map[tool_name].invoke, tool_args
+                )
+                result_str = str(tool_result)
+                print(
+                    f"[Orchestrator] ← {tool_name!r} returned "
+                    f"({len(result_str)} chars): {result_str[:120].replace(chr(10), ' ')!r}"
+                    f"{'...' if len(result_str) > 120 else ''}"
+                )
+                messages.append(
+                    ToolMessage(content=result_str, tool_call_id=tool_call["id"])
+                )
+
+        # ── Cost accounting ────────────────────────────────────────────────────
+        latency       = round(time.perf_counter() - start, 3)
+        total_input   = orch_input_tokens  + state["sub_input_tokens"]
+        total_output  = orch_output_tokens + state["sub_output_tokens"]
         cost = round(
-            input_tokens  * LLM_INPUT_COST_PER_M  / 1_000_000 +
-            output_tokens * LLM_OUTPUT_COST_PER_M / 1_000_000,
+            total_input  * LLM_INPUT_COST_PER_M  / 1_000_000 +
+            total_output * LLM_OUTPUT_COST_PER_M / 1_000_000,
             8,
         )
 
-        print(f"[agent] ◀ Done — latency={latency}s  cost=${cost:.8f}  tokens={input_tokens}+{output_tokens}  confidence={final['confidence_score']}  sources={final.get('sources', [])}")
+        print(
+            f"[Orchestrator] ◀ Done — latency={latency}s  cost=${cost:.8f}  "
+            f"tokens(orch)={orch_input_tokens}+{orch_output_tokens}  "
+            f"tokens(sub)={state['sub_input_tokens']}+{state['sub_output_tokens']}  "
+            f"confidence={state['confidence_score']}  sources={state['sources']}"
+        )
 
         return {
-            "answer": final["answer"],
-            "confidence_score": final["confidence_score"],
-            "latency_seconds": latency,
-            "cost_usd": cost,
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "approach": "agentic_rag",
-            "sources": final.get("sources", []),
+            "answer":            response.content.strip(),
+            "confidence_score":  state["confidence_score"],
+            "latency_seconds":   latency,
+            "cost_usd":          cost,
+            "input_tokens":      total_input,
+            "output_tokens":     total_output,
+            "approach":          "agentic_rag",
+            "sources":           state["sources"],
         }

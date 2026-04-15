@@ -13,12 +13,14 @@ import shutil
 import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Annotated, Any, Dict, List
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+
+from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
+from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, Field
 
 load_dotenv()
@@ -29,6 +31,7 @@ sys.path.append(str(Path(__file__).parent))
 
 from approach1_rag.pipeline import RAGPipeline
 from approach2_agents.orchestrator import LegalQAOrchestrator
+from auth import create_access_token, require_auth, verify_credentials
 from shared.pdf_parser import parse_pdfs
 from shared.vector_store import VectorStore
 
@@ -114,6 +117,11 @@ app.add_middleware(
 
 # ── Pydantic schemas ──────────────────────────────────────────────────────────
 
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+
 class QuestionRequest(BaseModel):
     question: str = Field(..., min_length=1, example="What is the effective date of the agreement between parties X and Y?")
 
@@ -132,6 +140,36 @@ class CombinedAnswerResponse(BaseModel):
     question: str
     traditional_rag: ApproachResult
     agentic_rag: ApproachResult
+
+
+# ── /auth ────────────────────────────────────────────────────────────────────
+
+@app.post(
+    "/auth/token",
+    response_model=TokenResponse,
+    tags=["auth"],
+    summary="Log in and get a Bearer token",
+)
+async def login(form: Annotated[OAuth2PasswordRequestForm, Depends()]):
+    """Exchange username + password for a signed JWT Bearer token.
+
+    Use the returned token in the `Authorization: Bearer <token>` header
+    (or click the **Authorize** button in Swagger UI) to access all other endpoints.
+
+    Credentials are configured via environment variables:
+    - `AUTH_USERNAME` (default: `admin`)
+    - `AUTH_PASSWORD` (required)
+    - `JWT_SECRET_KEY` (required — long random string)
+    - `JWT_EXPIRE_MINUTES` (default: `60`)
+    """
+    if not verify_credentials(form.username, form.password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    token = create_access_token(form.username)
+    return TokenResponse(access_token=token)
 
 
 # ── /ingest ───────────────────────────────────────────────────────────────────
@@ -162,7 +200,10 @@ class CombinedAnswerResponse(BaseModel):
         }
     },
 )
-async def ingest(files: List[UploadFile] = File(...)):
+async def ingest(
+    files: List[UploadFile] = File(...),
+    _: Annotated[str, Depends(require_auth)] = "",
+):
     """Upload one or more legal PDF files.
 
     The API will:
@@ -237,7 +278,10 @@ async def ingest(files: List[UploadFile] = File(...)):
     response_model=CombinedAnswerResponse,
     summary="Ask a question — runs both RAG approaches in parallel",
 )
-async def ask(request: QuestionRequest):
+async def ask(
+    request: QuestionRequest,
+    _: Annotated[str, Depends(require_auth)] = "",
+):
     """Ask a natural-language question over the indexed legal documents.
 
     Both approaches run **in parallel** and their results are returned together
@@ -313,7 +357,7 @@ async def ask(request: QuestionRequest):
 # ── /debug ───────────────────────────────────────────────────────────────────
 
 @app.post("/collection/reset", summary="Drop and recreate the vector collection (use before re-ingesting with a new embedding model)")
-async def collection_reset():
+async def collection_reset(_: Annotated[str, Depends(require_auth)] = ""):
     """Deletes the existing Qdrant collection and recreates it empty with the
     current VECTOR_SIZE.  Run this once after changing the embedding model,
     then re-upload all documents via /ingest."""
@@ -324,7 +368,7 @@ async def collection_reset():
 
 
 @app.get("/debug/collection-info", summary="Show Qdrant collection vector dimensions (debug only)")
-async def debug_collection_info():
+async def debug_collection_info(_: Annotated[str, Depends(require_auth)] = ""):
     """Return the vector config of the Qdrant collection so you can verify
     the stored dimension matches the current embedding model's output size."""
     if vector_store is None:
@@ -344,7 +388,7 @@ async def debug_collection_info():
 
 
 @app.get("/debug/keyword", summary="Scan all chunks for a keyword (debug only)")
-async def debug_keyword(q: str, limit: int = 5):
+async def debug_keyword(q: str, limit: int = 5, _: Annotated[str, Depends(require_auth)] = ""):
     """Scroll the entire Qdrant collection for chunks whose text contains 'q'.
     Returns the raw chunk content so you can verify what was indexed."""
     if vector_store is None:
@@ -354,7 +398,7 @@ async def debug_keyword(q: str, limit: int = 5):
 
 
 @app.get("/debug/semantic", summary="Run a high-k semantic search (debug only)")
-async def debug_semantic(q: str, top_k: int = 50):
+async def debug_semantic(q: str, top_k: int = 50, _: Annotated[str, Depends(require_auth)] = ""):
     """Return the top-N semantically similar chunks for a query with their scores."""
     if vector_store is None:
         raise HTTPException(status_code=503, detail="Vector store not ready.")

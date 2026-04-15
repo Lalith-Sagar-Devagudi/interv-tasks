@@ -1,11 +1,14 @@
+"""QueryRestructureAgent — sub-agent responsible for scope checking and query rewriting.
+
+Receives the user's raw question, checks whether it falls within the legal corpus,
+and rewrites it into a precise natural-language search query for the vector DB.
+Returns the NOT_ANSWERABLE sentinel when the question is completely outside scope.
+"""
+
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
-# Injected at startup by the orchestrator
-_llm: ChatOpenAI | None = None
-
-# Sentinel value returned (and propagated through graph state) when the
-# question cannot be answered from the available corpus.
+# Sentinel propagated through the multi-agent pipeline when a question is out of scope.
 NOT_ANSWERABLE = "NOT_ANSWERABLE"
 
 _CORPUS_DESCRIPTION = """\
@@ -58,7 +61,6 @@ no extra text.
 def _build_system_prompt(topics: list[str] | None) -> str:
     """Combine the base system prompt with the current corpus topic list."""
     if not topics:
-        # No topic context yet — fall back to plain rewrite with broad corpus hint
         return (
             "You are a legal research assistant with access to a corpus of legal "
             "documents and academic books on international criminal law, criminal "
@@ -76,32 +78,30 @@ def _build_system_prompt(topics: list[str] | None) -> str:
     return _SYSTEM_BASE.replace("{topics}", topic_str)
 
 
-def init_restructure_tool(llm: ChatOpenAI) -> None:
-    """Inject the LLM instance before the tool is called."""
-    global _llm
-    _llm = llm
+class QueryRestructureAgent:
+    """Specialized sub-agent for scope checking and query rewriting.
 
-
-def _do_restructure(
-    llm: ChatOpenAI,
-    question: str,
-    topics: list[str] | None = None,
-) -> tuple[str, dict]:
-    """Core logic — sync.
-
-    Returns:
-        (restructured_query, usage_metadata)
-
-        restructured_query is either a rewritten search string or the
-        ``NOT_ANSWERABLE`` sentinel when the question is out of corpus scope.
+    Has its own LLM instance and system prompt. Operates independently of the
+    other sub-agents — the orchestrator calls it as a black box.
     """
-    system_prompt = _build_system_prompt(topics)
-    messages = [
-        SystemMessage(content=system_prompt),
-        HumanMessage(content=f"Original question: {question}"),
-    ]
-    response = llm.invoke(messages)
-    usage = response.usage_metadata or {}
-    restructured = response.content.strip()
-    print(f"[tool:query_restructure] {question!r} → {restructured!r}")
-    return restructured, usage
+
+    def __init__(self, llm: ChatOpenAI) -> None:
+        self._llm = llm
+
+    def run(self, question: str, topics: list[str] | None = None) -> tuple[str, dict]:
+        """Scope-check and rewrite the question.
+
+        Returns:
+            (restructured_query, usage_metadata)
+            restructured_query is either a rewritten search string or NOT_ANSWERABLE.
+        """
+        system_prompt = _build_system_prompt(topics)
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=f"Original question: {question}"),
+        ]
+        response = self._llm.invoke(messages)
+        usage = response.usage_metadata or {}
+        restructured = response.content.strip()
+        print(f"[QueryRestructureAgent] {question!r} → {restructured!r}  usage={usage}")
+        return restructured, usage

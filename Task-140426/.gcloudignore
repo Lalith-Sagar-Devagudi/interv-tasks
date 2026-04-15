@@ -1,0 +1,27 @@
+.git
+.gitignore
+.DS_Store
+
+# Python artifacts
+**/__pycache__
+**/*.pyc
+**/*.pyo
+.venv
+backend/.venv
+
+# Secrets — never upload
+.env
+**/.env
+
+# Tests and local reports
+test/
+backend/tests/
+test/node_modules/
+test/reports/
+test/test-results/
+
+# Docs
+docs/
+
+# Docker Compose is for local dev only
+docker-compose.yml

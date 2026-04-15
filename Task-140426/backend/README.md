@@ -17,6 +17,8 @@ API docs available at `http://localhost:8000/docs` once running.
 
 ## Architecture Overview
 
+### Shared Ingestion Pipeline (`POST /ingest`)
+
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                        POST /ingest                             │
@@ -27,15 +29,16 @@ API docs available at `http://localhost:8000/docs` once running.
                 │      pdf_parser       │
                 │  pymupdf4llm → text   │
                 │  RecursiveTextSplitter│
-                │  (1500 chars, 200     │
+                │  (1500 chars, 300     │
                 │   overlap, legal      │
                 │   separator hierarchy)│
                 └───────────┬───────────┘
                             │  List[Document]
                 ┌───────────▼───────────┐
                 │      embedder         │
-                │  text-embedding-3-*   │
-                │  via OpenAI / OpenRouter│
+                │  text-embedding-3-    │
+                │  small via OpenAI /   │
+                │  OpenRouter           │
                 └───────────┬───────────┘
                             │  1536-dim vectors
                 ┌───────────▼───────────┐
@@ -44,6 +47,10 @@ API docs available at `http://localhost:8000/docs` once running.
                 │  collection: legal_docs│
                 └───────────────────────┘
 ```
+
+---
+
+### `POST /ask` — both approaches run in parallel
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -58,67 +65,74 @@ API docs available at `http://localhost:8000/docs` once running.
           ▼                             ▼
   ┌───────────────┐           ┌─────────────────────┐
   │  Approach 1   │           │     Approach 2      │
-  │ Traditional   │           │   Agentic RAG        │
-  │    RAG        │           │   (LangGraph)        │
+  │ Traditional   │           │   Multi-Agent RAG   │
+  │    RAG        │           │   (Tool-Calling)    │
   └───────┬───────┘           └──────────┬──────────┘
           │                              │
           ▼                              ▼
   ┌───────────────┐           ┌─────────────────────┐
-  │  VectorStore  │           │  Node 1             │
-  │ similarity    │           │  query_restructure  │
-  │ search top-20 │           │                     │
-  │ (semantic +   │           │  TopicExtractor     │
-  │  keyword      │           │  (TF-IDF over       │
-  │  hybrid)      │           │  corpus) → topics   │
-  └───────┬───────┘           │                     │
-          │                   │  LLM scope check:   │
-          ▼                   │  in-scope → rewrite │
-  ┌───────────────┐           │  off-topic →        │
-  │  AnswerGen    │           │  NOT_ANSWERABLE      │
-  │  DeepSeek V3  │           └──────────┬──────────┘
-  │  via OpenRouter│                     │
-  │               │           ┌──────────▼──────────┐
-  │  Answer only  │           │  Node 2             │
-  │  from context │           │  vector_search      │
-  └───────┬───────┘           │                     │
-          │                   │  VectorStore        │
-          │                   │  similarity search  │
-          │                   │  top-10             │
-          │                   │  (semantic +        │
-          │                   │   keyword hybrid)   │
+  │  VectorStore  │           │  Orchestrator LLM   │
+  │ similarity    │           │                     │
+  │ search top-20 │           │  Reads system prompt│
+  │ (semantic +   │           │  → drives 3 tool    │
+  │  keyword      │           │    calls in sequence│
+  │  hybrid)      │           │  → answers itself   │
+  └───────┬───────┘           └──────────┬──────────┘
+          │                              │
+          ▼                   ┌──────────▼──────────┐
+  ┌───────────────┐           │  Tool 1             │
+  │  AnswerGen    │           │  QueryRestructure   │
+  │  DeepSeek V3  │           │  Agent (own LLM)    │
+  │  via OpenRouter│          │                     │
+  │               │           │  TF-IDF scope check │
+  │  Answer only  │           │  → rewrite query or │
+  │  from context │           │  → NOT_ANSWERABLE   │
+  └───────┬───────┘           └──────────┬──────────┘
+          │                              │
+          │                   ┌──────────▼──────────┐
+          │                   │  Tool 2             │
+          │                   │  DocumentRetriever  │
+          │                   │  (no LLM)           │
+          │                   │                     │
+          │                   │  Qdrant hybrid      │
+          │                   │  search top-10      │
+          │                   │  Stores full docs   │
+          │                   │  internally         │
           │                   └──────────┬──────────┘
           │                              │
           │                   ┌──────────▼──────────┐
-          │                   │  Node 3             │
-          │                   │  validate_relevance │
+          │                   │  Tool 3             │
+          │                   │  RelevanceValidator │
+          │                   │  Agent (own LLM)    │
           │                   │                     │
-          │                   │  LLM judges each    │
-          │                   │  chunk: keep or     │
-          │                   │  discard            │
-          │                   │  Returns JSON:      │
-          │                   │  {relevant_excerpts}│
+          │                   │  Reads stored docs  │
+          │                   │  → keeps only       │
+          │                   │  relevant excerpts  │
+          │                   │  → returns to       │
+          │                   │  Orchestrator       │
           │                   └──────────┬──────────┘
           │                              │
           │                   ┌──────────▼──────────┐
-          │                   │  Node 4             │
-          │                   │  generate_answer    │
+          │                   │  Orchestrator LLM   │
+          │                   │  (Step 4 — no tool) │
           │                   │                     │
-          │                   │  LLM answers from   │
-          │                   │  validated excerpts │
-          │                   │  only               │
+          │                   │  Uses validated     │
+          │                   │  excerpts already   │
+          │                   │  in context to      │
+          │                   │  write final answer │
           │                   └──────────┬──────────┘
           │                              │
           └──────────────┬───────────────┘
                          ▼
           ┌──────────────────────────────┐
           │   CombinedAnswerResponse     │
-          │                              │
-          │  traditional_rag: {          │
+          │                             │
+          │  traditional_rag: {         │
           │    answer, confidence_score, │
           │    latency_seconds, cost_usd,│
-          │    input_tokens,             │
-          │    output_tokens, sources    │
-          │  }                           │
+          │    input_tokens,            │
+          │    output_tokens, sources   │
+          │  }                          │
           │  agentic_rag: { same fields }│
           └──────────────────────────────┘
 ```
@@ -133,9 +147,11 @@ API docs available at `http://localhost:8000/docs` once running.
 |---|---|---|
 | `VectorStore` | `vector_store.py` | Qdrant wrapper. Creates collection on first ingest, exposes semantic + keyword hybrid search, document-level text export for TF-IDF |
 | `pdf_parser` | `pdf_parser.py` | pymupdf4llm → markdown, then RecursiveCharacterTextSplitter with legal separator hierarchy (ARTICLE → SECTION → paragraph → sentence) |
-| `embedder` | `embedder.py` | OpenAI `text-embedding-3-small/large` via direct API key or OpenRouter fallback |
+| `embedder` | `embedder.py` | OpenAI `text-embedding-3-small` via direct API key or OpenRouter fallback |
 | `TopicExtractor` | `topic_extractor.py` | Pure-Python TF-IDF over the full corpus. Extracts ~23 high-signal topic terms (bigrams + unigrams). Cache-aware: auto-refreshes when Qdrant point count changes after ingest |
 | `config` | `config.py` | All env-var driven settings (models, keys, chunk sizes, pricing) |
+
+---
 
 ### Approach 1 — Traditional RAG (`approach1_rag/`)
 
@@ -157,54 +173,79 @@ AnswerGenerator.generate(question, context)
 answer + avg_cosine_confidence + latency + cost
 ```
 
-### Approach 2 — Agentic RAG (`approach2_agents/`)
+**LLM calls per request: 1**
 
-Four-node LangGraph graph. Each node is a synchronous function run via LangGraph's async executor.
+---
+
+### Approach 2 — Multi-Agent RAG (`approach2_agents/`)
+
+An orchestrator LLM drives the pipeline through native tool-calling. Three specialist
+sub-agents are registered as tools. The orchestrator's system prompt defines the
+mandatory 4-step workflow — the LLM decides when each tool is called and generates
+the final answer itself without delegating to a fourth agent.
 
 ```
-START
-  │
-  ▼
-[restructure_query]  ←── TopicExtractor.get_topics(store)
-  │  Scope check: is this question in the corpus?
-  │  YES → rewrite query for better VDB recall
-  │  NO  → set restructured_query = "NOT_ANSWERABLE"
-  │
-  ▼
-[retrieve_docs]
-  │  If NOT_ANSWERABLE → skip, return empty
-  │  Else → VectorStore.similarity_search(restructured_query, top_k=10)
-  │
-  ▼
-[validate_relevance]
-  │  If empty docs → skip
-  │  Else → LLM judges each chunk, returns only relevant ones as JSON
-  │
-  ▼
-[generate_answer]
-  │  If NOT_ANSWERABLE → return "This question cannot be answered with the available data."
-  │  Else → LLM answers from validated excerpts only
-  │
-  END
+Orchestrator LLM (reads system prompt)
+     │
+     ├─ tool call ──► QueryRestructureAgent (own LLM)
+     │                 Scope check + query rewrite
+     │                 → returns restructured query or NOT_ANSWERABLE
+     │
+     ├─ tool call ──► DocumentRetriever (no LLM — Qdrant only)
+     │                 Hybrid vector + keyword search, top-10
+     │                 → returns retrieval summary to orchestrator
+     │                 → stores full excerpts internally for Tool 3
+     │
+     ├─ tool call ──► RelevanceValidatorAgent (own LLM)
+     │                 Reads stored excerpts, keeps only relevant ones
+     │                 → returns validated excerpts to orchestrator
+     │
+     └─ (no more tool calls)
+          Orchestrator generates final answer from validated excerpts in context
 ```
 
-**State schema (`QAState`):**
+**LLM instances:** 3 independent (`QueryRestructureAgent`, `RelevanceValidatorAgent`, `Orchestrator`)
 
-| Field | Type | Description |
-|---|---|---|
-| `question` | `str` | Original user question, never mutated |
-| `restructured_query` | `str` | Rewritten query or `NOT_ANSWERABLE` |
-| `retrieved_docs` | `str` | Raw formatted excerpts from Qdrant |
-| `validated_docs` | `str` | Filtered excerpts after relevance check |
-| `sources` | `list[str]` | Unique source filenames |
-| `answer` | `str` | Final answer |
-| `confidence_score` | `float` | Avg cosine similarity of retrieved chunks |
-| `input_tokens` | `int` | Accumulated across all 3 LLM nodes |
-| `output_tokens` | `int` | Accumulated across all 3 LLM nodes |
+**LLM calls per request:** 2–4 total
+- 1 restructure (QueryRestructureAgent) — always
+- 1 validate (RelevanceValidatorAgent) — skipped if no docs retrieved
+- 1–2 orchestrator turns (more if the LLM requests multiple tool calls in sequence)
+- Off-topic short-circuit: only 1 call (restructure returns NOT_ANSWERABLE, pipeline exits)
+
+#### Orchestrator system prompt (abridged)
+
+The orchestrator is given a strict 4-step workflow in its system prompt:
+
+```
+STEP 1 — RESTRUCTURE: call `restructure_query`
+  ▸ If NOT_ANSWERABLE → stop, return fixed message
+
+STEP 2 — RETRIEVE: call `retrieve_documents` with restructured query
+  ▸ If no docs found → stop, return fixed message
+
+STEP 3 — VALIDATE: call `validate_relevance` with the original question
+  ▸ If no relevant excerpts → stop, return fixed message
+
+STEP 4 — ANSWER: write the final answer yourself (no tool call)
+  ▸ Ground every claim in the validated excerpts
+  ▸ Cite article/clause numbers where present
+```
+
+#### Token accounting
+
+Tokens are accumulated across all LLM instances and reported as a single total:
+
+| Source | What is counted |
+|---|---|
+| `sub_input_tokens` / `sub_output_tokens` | QueryRestructureAgent + RelevanceValidatorAgent |
+| `orch_input_tokens` / `orch_output_tokens` | All orchestrator LLM turns (tool-calling loop + final answer) |
+| **Reported total** | sub + orch combined |
+
+---
 
 ### TF-IDF Topic Extractor (`shared/topic_extractor.py`)
 
-Prevents the query-restructure LLM from generating hallucinated queries for off-topic questions.
+Prevents the QueryRestructureAgent from generating hallucinated queries for off-topic questions.
 
 **How it works:**
 
@@ -251,19 +292,6 @@ misconduct, disclosure, detention, reparations, accountability,
 hypotheses, norwegian, statute, constitutional, referral, sexual
 ```
 
-**Scope check in the restructure prompt:**
-
-The topics list is injected into the LLM prompt alongside a plain-language description of the corpus domains:
-- International criminal law (ICC, ICTY, KSC)
-- Criminal investigations: fraud, financial crimes, corruption
-- Criminal procedure: testimony, disclosure, detention, reparations
-- Norwegian / Nordic criminal law traditions
-- Political accountability (Council of Europe, Azerbaijan)
-- Philosophy and foundations of criminal law
-- Professional integrity and criticism of justice institutions
-
-The LLM is instructed to return `NOT_ANSWERABLE` **only** for questions completely outside the legal domain (cooking, weather, sports, etc.). For anything with plausible legal relevance it rewrites the query.
-
 ---
 
 ## API Endpoints
@@ -303,6 +331,9 @@ The LLM is instructed to return `NOT_ANSWERABLE` **only** for questions complete
   }
 }
 ```
+
+`input_tokens` and `output_tokens` in `agentic_rag` are the sum across all LLM instances
+(orchestrator + QueryRestructureAgent + RelevanceValidatorAgent).
 
 ---
 
@@ -344,24 +375,23 @@ LLM_OUTPUT_COST_PER_M=1.10
 ```
 backend/
 ├── app/
-│   ├── app.py                          # FastAPI app, lifespan, all endpoints
+│   ├── app.py                              # FastAPI app, lifespan, all endpoints
 │   ├── shared/
-│   │   ├── config.py                   # All env-var settings
-│   │   ├── embedder.py                 # OpenAI embeddings (direct or via OpenRouter)
-│   │   ├── pdf_parser.py               # PDF → chunks (pymupdf4llm + text splitter)
-│   │   ├── vector_store.py             # Qdrant wrapper (ingest, search, scroll)
-│   │   └── topic_extractor.py          # TF-IDF corpus topic extraction + cache
+│   │   ├── config.py                       # All env-var settings
+│   │   ├── embedder.py                     # OpenAI embeddings (direct or via OpenRouter)
+│   │   ├── pdf_parser.py                   # PDF → chunks (pymupdf4llm + text splitter)
+│   │   ├── vector_store.py                 # Qdrant wrapper (ingest, search, scroll)
+│   │   └── topic_extractor.py             # TF-IDF corpus topic extraction + cache
 │   ├── approach1_rag/
-│   │   ├── pipeline.py                 # Orchestrates retrieve → generate
-│   │   ├── retriever.py                # Hybrid vector + keyword search
-│   │   ├── answer_generator.py         # DeepSeek V3 answer synthesis
-│   │   └── confidence_scorer.py        # Avg cosine similarity scorer
+│   │   ├── pipeline.py                     # Orchestrates retrieve → generate
+│   │   ├── retriever.py                    # Hybrid vector + keyword search
+│   │   ├── answer_generator.py             # DeepSeek V3 answer synthesis
+│   │   └── confidence_scorer.py           # Avg cosine similarity scorer
 │   └── approach2_agents/
-│       ├── orchestrator.py             # LangGraph graph, 4-node pipeline
+│       ├── orchestrator.py                 # Orchestrator LLM + tool-calling loop
 │       └── tools/
-│           ├── query_restructure_tool.py   # Node 1: scope check + query rewrite
-│           ├── vector_search_tool.py       # Node 2: Qdrant search
-│           └── relevance_validator_tool.py # Node 3: LLM relevance filter
+│           ├── query_restructure_tool.py   # QueryRestructureAgent (own LLM)
+│           └── relevance_validator_tool.py # RelevanceValidatorAgent (own LLM)
 ├── pyproject.toml
 └── README.md
 ```
@@ -370,25 +400,34 @@ backend/
 
 ## Models Used
 
-| Role | Model | Via |
-|---|---|---|
-| Answer generation (both approaches) | `deepseek/deepseek-v3.2` | OpenRouter |
-| Query restructure (approach 2) | `deepseek/deepseek-v3.2` | OpenRouter |
-| Relevance validation (approach 2) | `deepseek/deepseek-v3.2` | OpenRouter |
-| Embeddings | `text-embedding-3-small` (default) | OpenAI direct or OpenRouter |
+| Role | Model | Via | LLM instance |
+|---|---|---|---|
+| Answer generation (Approach 1) | `deepseek/deepseek-v3.2` | OpenRouter | `AnswerGenerator` |
+| Query restructure (Approach 2 — Tool 1) | `deepseek/deepseek-v3.2` | OpenRouter | `QueryRestructureAgent` |
+| Relevance validation (Approach 2 — Tool 3) | `deepseek/deepseek-v3.2` | OpenRouter | `RelevanceValidatorAgent` |
+| Orchestration + final answer (Approach 2 — Step 4) | `deepseek/deepseek-v3.2` | OpenRouter | `LegalQAOrchestrator` |
+| Embeddings | `text-embedding-3-small` (default) | OpenAI direct or OpenRouter | `embedder.get_embeddings()` |
 
-DeepSeek V3 context window: **64 K tokens**. The full restructure system prompt (corpus description + ~23 TF-IDF topics) uses ~530 tokens.
+All four LLM instances share the same model and pricing but are independent objects —
+each can be swapped to a different model via env-var overrides if needed.
+
+DeepSeek V3 context window: **64 K tokens**. The orchestrator system prompt uses ~400 tokens;
+the restructure system prompt (corpus description + ~23 TF-IDF topics) uses ~530 tokens.
 
 ---
 
 ## Approach Comparison
 
-| | Traditional RAG | Agentic RAG |
+| | Traditional RAG | Multi-Agent RAG |
 |---|---|---|
-| LLM calls per query | 1 | 2–3 |
+| Architecture | Deterministic pipeline | Orchestrator LLM + 3 specialist sub-agents |
+| Flow control | Code (hardcoded) | Orchestrator LLM (tool-calling loop) |
+| LLM instances | 1 | 3 (orchestrator + restructure agent + validator agent) |
+| LLM calls per query | 1 | 2–4 (varies by tool-calling turns) |
 | Retrieval query | Raw user question | LLM-rewritten for VDB recall |
-| Chunk filtering | None (top-20 passed to LLM) | LLM validates relevance |
-| Off-topic handling | Answers "not found" after retrieval | Detects before retrieval, skips all LLM calls |
-| Typical latency | ~1–4 s | ~5–10 s |
-| Typical cost | Lower | Higher |
+| Chunk filtering | None (top-20 passed to LLM) | RelevanceValidatorAgent filters before orchestrator answers |
+| Off-topic handling | Answers "not found" after retrieval | QueryRestructureAgent detects before retrieval; orchestrator exits early |
+| Final answer generated by | `AnswerGenerator` class | Orchestrator LLM itself (Step 4, no tool call) |
+| Typical latency | ~1–4 s | ~5–12 s |
+| Typical cost | Lower | Higher (3 LLM instances, 2–4 calls) |
 | Answer quality | Good on simple factual queries | Better on complex/ambiguous queries |
