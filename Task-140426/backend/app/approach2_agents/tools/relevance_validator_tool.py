@@ -1,7 +1,6 @@
 import json
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 
 # Injected at startup by the orchestrator
@@ -64,22 +63,3 @@ def _do_validate(llm: ChatOpenAI, question: str, retrieved_docs: str) -> tuple[s
     except (json.JSONDecodeError, ValueError):
         print("[tool:validate_relevance] JSON parse failed — passing all docs through")
         return retrieved_docs, usage
-
-
-@tool
-def validate_relevance(question: str, retrieved_docs: str) -> str:
-    """Judge which retrieved document excerpts are truly relevant to the question.
-
-    Filters out off-topic chunks and returns only the excerpts that directly
-    help answer the question, preserving their original formatting.
-
-    Args:
-        question: The original user question.
-        retrieved_docs: Formatted document excerpts from the vector search tool.
-
-    Returns:
-        Filtered excerpts containing only the relevant content.
-    """
-    if _llm is None or not retrieved_docs.strip():
-        return retrieved_docs
-    return _do_validate(_llm, question, retrieved_docs)[0]

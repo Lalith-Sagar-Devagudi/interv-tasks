@@ -60,11 +60,12 @@ app = FastAPI(
         "**Approach 1** — Traditional RAG: deterministic single-pass pipeline — "
         "retrieve docs from VDB → (query + docs) + LLM → answer. "
         "Uses **DeepSeek V3** via OpenRouter.\n\n"
-        "**Approach 2** — Agentic RAG: three-tool LangGraph pipeline — "
-        "(1) **query_restructure**: LLM enriches the query for better VDB recall; "
-        "(2) **vector_search**: retrieves docs using the enriched query; "
-        "(3) **validate_relevance**: LLM filters chunks down to only those that help answer the question; "
-        "then final LLM call produces the answer. "
+        "**Approach 2** — Agentic RAG: four-node LangGraph pipeline — "
+        "(1) **query_restructure**: scope-checks the question against TF-IDF corpus topics, "
+        "rewrites it for better VDB recall, or short-circuits with NOT_ANSWERABLE; "
+        "(2) **vector_search**: retrieves top-10 chunks using the enriched query; "
+        "(3) **validate_relevance**: LLM filters chunks to only those that help answer the question; "
+        "(4) **generate_answer**: final LLM call produces the answer. "
         "Uses **DeepSeek V3** via OpenRouter."
     ),
     version="1.0.0",
@@ -310,6 +311,37 @@ async def ask(request: QuestionRequest):
 
 
 # ── /debug ───────────────────────────────────────────────────────────────────
+
+@app.post("/collection/reset", summary="Drop and recreate the vector collection (use before re-ingesting with a new embedding model)")
+async def collection_reset():
+    """Deletes the existing Qdrant collection and recreates it empty with the
+    current VECTOR_SIZE.  Run this once after changing the embedding model,
+    then re-upload all documents via /ingest."""
+    if vector_store is None:
+        raise HTTPException(status_code=503, detail="Vector store not ready.")
+    await asyncio.to_thread(vector_store.reset_collection)
+    return {"message": f"Collection reset. Ready to ingest with VECTOR_SIZE={vector_store.embeddings.model}."}
+
+
+@app.get("/debug/collection-info", summary="Show Qdrant collection vector dimensions (debug only)")
+async def debug_collection_info():
+    """Return the vector config of the Qdrant collection so you can verify
+    the stored dimension matches the current embedding model's output size."""
+    if vector_store is None:
+        raise HTTPException(status_code=503, detail="Vector store not ready.")
+    collections = vector_store.client.get_collections().collections
+    result = {}
+    for col in collections:
+        info = vector_store.client.get_collection(col.name)
+        vectors_cfg = info.config.params.vectors
+        result[col.name] = {
+            "points_count": info.points_count,
+            "indexed_vectors_count": info.indexed_vectors_count,
+            "vector_size": vectors_cfg.size if hasattr(vectors_cfg, "size") else str(vectors_cfg),
+            "distance": str(vectors_cfg.distance) if hasattr(vectors_cfg, "distance") else "unknown",
+        }
+    return result
+
 
 @app.get("/debug/keyword", summary="Scan all chunks for a keyword (debug only)")
 async def debug_keyword(q: str, limit: int = 5):

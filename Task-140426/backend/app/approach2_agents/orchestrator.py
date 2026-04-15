@@ -37,14 +37,15 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
 
 from approach2_agents.tools.query_restructure_tool import (
+    NOT_ANSWERABLE,
     _do_restructure,
     init_restructure_tool,
 )
+from shared.topic_extractor import TopicExtractor
 from approach2_agents.tools.relevance_validator_tool import (
     _do_validate,
     init_validator_tool,
 )
-from approach2_agents.tools.vector_search_tool import init_search_tool
 from shared.config import (
     LLM_INPUT_COST_PER_M,
     LLM_MAX_TOKENS,
@@ -82,10 +83,10 @@ class LegalQAOrchestrator:
             api_key=OPENROUTER_API_KEY,
             base_url=OPENROUTER_BASE_URL,
         )
-        init_search_tool(store)
         init_restructure_tool(self.llm)
         init_validator_tool(self.llm)
         self._store = store
+        self._topic_extractor = TopicExtractor()
         self.graph = self._build_graph()
 
     # ── Graph construction ────────────────────────────────────────────────────
@@ -109,10 +110,19 @@ class LegalQAOrchestrator:
     # ── Nodes (sync — run inside a worker thread via asyncio.to_thread) ───────
 
     def _restructure_node(self, state: QAState) -> dict:
-        """Tool 1 — Rewrite the user question into a targeted VDB search query."""
+        """Tool 1 — Rewrite the user question into a targeted VDB search query.
+
+        Fetches the current corpus topics from TopicExtractor (cached, refreshed
+        on corpus change) and injects them into the LLM prompt so it can detect
+        when a question is outside the scope of the indexed documents.
+        """
         print(f"[agent:restructure] Original question: {state['question']!r}")
-        restructured, usage = _do_restructure(self.llm, state["question"])
-        print(f"[agent:restructure] Restructured query: {restructured!r}  usage={usage}")
+        topics = self._topic_extractor.get_topics(self._store)
+        restructured, usage = _do_restructure(self.llm, state["question"], topics)
+        if restructured == NOT_ANSWERABLE:
+            print("[agent:restructure] Question is out of corpus scope → NOT_ANSWERABLE")
+        else:
+            print(f"[agent:restructure] Restructured query: {restructured!r}  usage={usage}")
         return {
             "restructured_query": restructured,
             "input_tokens":  state.get("input_tokens",  0) + usage.get("input_tokens",  0),
@@ -122,6 +132,9 @@ class LegalQAOrchestrator:
     def _retrieve_node(self, state: QAState) -> dict:
         """Tool 2 — Retrieve document excerpts using the restructured query."""
         query = state["restructured_query"]
+        if query == NOT_ANSWERABLE:
+            print("[agent:retrieve] Skipping retrieval — question is out of corpus scope")
+            return {"retrieved_docs": "", "sources": [], "confidence_score": 0.0}
         print(f"[agent:retrieve] Querying VDB with: {query!r}")
 
         results = self._store.similarity_search_with_scores(query, top_k=10)
@@ -166,6 +179,15 @@ class LegalQAOrchestrator:
     def _generate_node(self, state: QAState) -> dict:
         """Final LLM call — answer the original question using validated excerpts."""
         print(f"[agent:generate] Generating answer with model={LLM_MODEL!r} ...")
+
+        if state.get("restructured_query") == NOT_ANSWERABLE:
+            print("[agent:generate] Returning NOT_ANSWERABLE response — question out of corpus scope")
+            return {
+                "answer": (
+                    "This question cannot be answered with the available data. "
+                    "The indexed document corpus does not contain information on this topic."
+                )
+            }
 
         context = state.get("validated_docs") or state.get("retrieved_docs", "")
         if not context:

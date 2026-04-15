@@ -5,31 +5,40 @@ load_dotenv()
 
 # ── API Keys ──────────────────────────────────────────────────────────────────
 OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
+OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")   # optional: direct OpenAI for embeddings
 QDRANT_URL: str = os.getenv("QDRANT_URL", "")
 QDRANT_API_KEY: str = os.getenv("QDRANT_API_KEY", "")
 
 # ── OpenRouter ────────────────────────────────────────────────────────────────
-# Used for both LLM inference (/chat/completions) and embeddings (/embeddings).
+# Used for LLM inference (/chat/completions).
 OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
+
+# ── OpenAI (direct) ───────────────────────────────────────────────────────────
+# If OPENAI_API_KEY is set, embeddings go directly to api.openai.com instead
+# of OpenRouter — useful when OpenRouter credits are exhausted.
+OPENAI_BASE_URL: str = "https://api.openai.com/v1"
 
 # ── Models ────────────────────────────────────────────────────────────────────
 # Single model used by both approaches
 LLM_MODEL: str = os.getenv("LLM_MODEL", "deepseek/deepseek-v3.2")
 
-# Embeddings — Qwen3-Embedding-8B via OpenRouter /embeddings endpoint
-EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "qwen/qwen3-embedding-8b")
+# Embeddings — text-embedding-3-small via OpenRouter /embeddings endpoint
+EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "openai/text-embedding-3-small")
 
 # ── Qdrant ────────────────────────────────────────────────────────────────────
 COLLECTION_NAME: str = "legal_docs"
-VECTOR_SIZE: int = 4096  # Qwen3-Embedding-8B output dimension
+VECTOR_SIZE: int = 1536  # text-embedding-3-small output dimension
 
 # ── Chunking ──────────────────────────────────────────────────────────────────
-# Larger chunks preserve full legal clauses and cross-references
-CHUNK_SIZE: int = 800     # ~600 tokens — fits one full legal clause
-CHUNK_OVERLAP: int = 150  # overlap catches clauses split across boundaries
+# text-embedding-3-large supports up to 8191 tokens; 1500 chars ≈ 300–375 tokens
+# which fits most full legal clauses and preserves argument context.
+# 300-char overlap (20%) ensures clauses split at a boundary still appear
+# complete in at least one neighbouring chunk.
+CHUNK_SIZE: int = 1500
+CHUNK_OVERLAP: int = 300
 
 # ── Retrieval ─────────────────────────────────────────────────────────────────
-RETRIEVAL_TOP_K: int = 20   # candidates pulled from vector DB
+RETRIEVAL_TOP_K: int = 20
 
 # ── LLM generation limits ────────────────────────────────────────────────────
 # Cap output tokens to avoid 402 "insufficient credits" errors from OpenRouter.
